@@ -270,6 +270,28 @@ static void process_pilot_status(void) {
     /* Rudder position (signed degrees, positive = starboard) */
     int8_t rudder = (int8_t)p[PL_RR];
 
+    /* Broadcast PGN 65379 on every status packet */
+    {
+        uint16_t mode65379;
+        switch (z) {
+            case 0x00U: mode65379 = 0U;   break;
+            case 0x02U: mode65379 = 64U;  break;
+            case 0x06U: mode65379 = 256U; break;
+            case 0x0AU: mode65379 = 384U; break;
+            default:    mode65379 = 0xFFFFU; break;
+        }
+        if (mode65379 != 0xFFFFU) {
+            uint8_t d65[8] = {
+                0x3BU, 0x9FU,
+                (uint8_t)(mode65379 & 0xFFU),
+                (uint8_t)((mode65379 >> 8) & 0xFFU),
+                p[PL_M_ALARM],
+                0x00U, 0x07U, 0x00U
+            };
+            send_raw_frame(PGN65379_ID, d65, 8U);
+        }
+    }
+
     /* Report mode change */
     if (z != g_last_z) {
         g_last_z = z;

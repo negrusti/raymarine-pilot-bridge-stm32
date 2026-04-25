@@ -24,12 +24,16 @@
 /* Same PGN, priority=7, for keystroke commands */
 #define KEYSTROKE_CMD_ID 0x1DEF7301UL
 
-/* PGN 65379 (0xFF63) autopilot status broadcast: priority=7, DP=0, PF=0xFF, PS=0x63, src=1 */
-#define PGN65379_ID      0x1CFF6301UL
+/* PGN 65379 (0xFF63) autopilot status broadcast: priority=7, DP=0, PF=0xFF, PS=0x63, src=115 */
+#define PGN65379_ID      0x1CFF6373UL
 
 /* PGN 126720 status from SeaTalk-NG (src=115). Mask ignores destination byte. */
 #define STATUS_ID_MASK  0x1FFF00FFUL
 #define STATUS_ID_VAL   0x1DEF0073UL
+
+/* PGN 126208 (Group Function) — Axiom sends locked heading commands here. */
+#define GRP_FUNC_MASK   0x01FF0000UL
+#define GRP_FUNC_VAL    0x01ED0000UL
 
 /* SeaTalk1 datagram 0x84: Compass heading / Autopilot course / Rudder / Mode
    Layout: 84 U6 VW XY 0Z 0M RR SS TT   (9 bytes)
@@ -47,18 +51,38 @@
 
 /* Fast-packet reassembly */
 #define FP_BUF_MAX 32U
-static struct {
+typedef struct {
     uint8_t buf[FP_BUF_MAX];
     uint8_t total;
     uint8_t got;
     uint8_t next_frame;
     uint8_t seq;
-} g_fp;
+    uint8_t src;  /* source address that started this reassembly */
+    uint8_t dst;  /* destination address from frame 0 */
+} FpState;
 
-/* Last known state — 0xFF forces output on first packet */
-static uint8_t g_last_z = 0xFFU;
-static uint8_t g_last_m = 0xFFU;
-static uint8_t g_print_next_crs;
+static FpState g_fp;      /* autopilot status (src=115) */
+static FpState g_fp_mfd;  /* MFD group function commands */
+
+/* Keystroke send queue — filled during RX, drained in main loop */
+#define KS_QUEUE_LEN 8U
+static uint8_t g_ks_queue[KS_QUEUE_LEN];
+static uint8_t g_ks_head;
+static uint8_t g_ks_tail;
+
+static void ks_enqueue(uint8_t key) {
+    uint8_t next = (uint8_t)((g_ks_tail + 1U) % KS_QUEUE_LEN);
+    if (next != g_ks_head) {
+        g_ks_queue[g_ks_tail] = key;
+        g_ks_tail = next;
+    }
+}
+
+/* Last known state — 0xFF/0xFFFF forces output on first packet */
+static uint8_t  g_last_z = 0xFFU;
+static uint8_t  g_last_m = 0xFFU;
+static uint8_t  g_print_next_crs;
+static uint16_t g_locked_crs = 0xFFFFU;  /* AP locked course in degrees, 0xFFFF=unknown */
 
 static CAN_HandleTypeDef g_hcan;
 static uint8_t g_fast_seq;
@@ -207,30 +231,81 @@ void can_send_keystroke(uint8_t key) {
 
 /* ---- RX: fast-packet reassembly ----------------------------------------- */
 
-static void fp_feed(const uint8_t *data) {
+static void fp_feed(FpState *fp, const uint8_t *data) {
     uint8_t idx = data[0] & 0x1FU;
     uint8_t seq = data[0] >> 5;
 
     if (idx == 0U) {
         uint8_t total = data[1];
-        if (total == 0U || total > FP_BUF_MAX) { g_fp.total = 0U; return; }
+        if (total == 0U || total > FP_BUF_MAX) { fp->total = 0U; return; }
         uint8_t copy = (total < 6U) ? total : 6U;
-        g_fp.total = total;
-        g_fp.got = copy;
-        g_fp.seq = seq;
-        g_fp.next_frame = 1U;
-        memcpy(g_fp.buf, &data[2], copy);
+        fp->total = total;
+        fp->got = copy;
+        fp->seq = seq;
+        fp->next_frame = 1U;
+        memcpy(fp->buf, &data[2], copy);
     } else {
-        if (g_fp.total == 0U || idx != g_fp.next_frame || seq != g_fp.seq) {
-            g_fp.total = 0U;
+        if (fp->total == 0U || idx != fp->next_frame || seq != fp->seq) {
+            fp->total = 0U;
             return;
         }
-        uint8_t remaining = g_fp.total - g_fp.got;
+        uint8_t remaining = fp->total - fp->got;
         uint8_t copy = (remaining < 7U) ? remaining : 7U;
-        memcpy(g_fp.buf + g_fp.got, &data[1], copy);
-        g_fp.got += copy;
-        g_fp.next_frame++;
+        memcpy(fp->buf + fp->got, &data[1], copy);
+        fp->got += copy;
+        fp->next_frame++;
     }
+}
+
+/* ---- RX: Group Function (PGN 126208) locked heading decode --------------- */
+
+static void process_grp_func(uint8_t src, uint8_t dst) {
+    const uint8_t *p = g_fp_mfd.buf;
+    if (g_fp_mfd.total < 17U) return;
+    if (p[0] != 0x01U) return;                                    /* Command only */
+    if (p[1] != 0x50U || p[2] != 0xFFU || p[3] != 0x00U) return; /* PGN 65360 */
+
+    /* Magnetic heading: payload[15..16] LE uint16, units = 1/10000 rad → degrees */
+    uint16_t raw = (uint16_t)p[15] | ((uint16_t)p[16] << 8);
+    uint16_t target = (uint16_t)(((uint32_t)raw * 180U + 15708U) / 31416U) % 360U;
+
+    /* Log the commanded heading and current locked course for diagnostics */
+    {
+        char line[32];
+        uint8_t pos = 0;
+        line[pos++] = '^'; line[pos++] = ' '; line[pos++] = 'C';
+        fmt3(line + pos, target); pos += 3;
+        line[pos++] = ' '; line[pos++] = 'L';
+        if (g_locked_crs == 0xFFFFU) {
+            line[pos++] = '?'; line[pos++] = '?'; line[pos++] = '?';
+        } else {
+            fmt3(line + pos, g_locked_crs);
+        }
+        pos += 3;
+        line[pos++] = ' '; line[pos++] = 's';
+        fmt3(line + pos, src); pos += 3;
+        line[pos++] = ' '; line[pos++] = 'd';
+        fmt3(line + pos, dst); pos += 3;
+        line[pos++] = '\r'; line[pos++] = '\n';
+        cdc_transmit((uint8_t *)line, pos);
+    }
+
+    /* Translate to relative keystrokes using current AP locked course */
+    if (g_locked_crs == 0xFFFFU) return;
+
+    int16_t delta = (int16_t)target - (int16_t)g_locked_crs;
+    if (delta > 180)  delta -= 360;
+    if (delta < -180) delta += 360;
+    if (delta == 0) return;
+    /* Sanity guard: ignore implausibly large jumps */
+    if (delta > 30 || delta < -30) return;
+
+    uint8_t key10 = (delta > 0) ? ']' : '[';
+    uint8_t key1  = (delta > 0) ? '+' : '-';
+    if (delta < 0) delta = -delta;
+
+    while (delta >= 10) { ks_enqueue(key10); delta -= 10; }
+    while (delta > 0)   { ks_enqueue(key1);  delta--;     }
 }
 
 /* ---- RX: ST1 0x84 status decode ----------------------------------------- */
@@ -269,6 +344,8 @@ static void process_pilot_status(void) {
 
     /* Rudder position (signed degrees, positive = starboard) */
     int8_t rudder = (int8_t)p[PL_RR];
+
+    g_locked_crs = crs % 360U;
 
     /* Broadcast PGN 65379 on every status packet */
     {
@@ -346,6 +423,15 @@ static void process_pilot_status(void) {
     }
 }
 
+/* ---- TX: drain keystroke queue ------------------------------------------ */
+
+void can_handler_tx_poll(void) {
+    while (g_ks_head != g_ks_tail) {
+        can_send_keystroke(g_ks_queue[g_ks_head]);
+        g_ks_head = (uint8_t)((g_ks_head + 1U) % KS_QUEUE_LEN);
+    }
+}
+
 /* ---- Poll --------------------------------------------------------------- */
 
 void can_handler_poll(void) {
@@ -359,11 +445,30 @@ void can_handler_poll(void) {
 
         if (hdr.IDE != CAN_ID_EXT || hdr.RTR != CAN_RTR_DATA) continue;
 
+        uint8_t frame_src = (uint8_t)(hdr.ExtId & 0xFFU);
+
         if ((hdr.ExtId & STATUS_ID_MASK) == STATUS_ID_VAL) {
-            fp_feed(data);
+            fp_feed(&g_fp, data);
             if (g_fp.total > 0U && g_fp.got >= g_fp.total) {
                 process_pilot_status();
                 g_fp.total = 0U;
+            }
+        } else if (frame_src != 0x01U && frame_src != 0x73U &&
+                   (hdr.ExtId & GRP_FUNC_MASK) == GRP_FUNC_VAL) {
+            uint8_t idx = data[0] & 0x1FU;
+            if (idx == 0U) {
+                /* Frame 0: record who owns this reassembly */
+                g_fp_mfd.src = frame_src;
+                g_fp_mfd.dst = (uint8_t)((hdr.ExtId >> 8) & 0xFFU);
+            } else if (frame_src != g_fp_mfd.src) {
+                /* Continuation from wrong source (e.g. AP ack) — discard and reset */
+                g_fp_mfd.total = 0U;
+                continue;
+            }
+            fp_feed(&g_fp_mfd, data);
+            if (g_fp_mfd.total > 0U && g_fp_mfd.got >= g_fp_mfd.total) {
+                process_grp_func(g_fp_mfd.src, g_fp_mfd.dst);
+                g_fp_mfd.total = 0U;
             }
         }
     }

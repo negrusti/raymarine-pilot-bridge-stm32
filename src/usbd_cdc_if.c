@@ -4,12 +4,24 @@
 
 #include "usb_device.h"
 
-#define CDC_RX_BUF_SIZE 64U
-#define CDC_TX_BUF_SIZE 64U
+#define CDC_RX_BUF_SIZE  64U
+#define CDC_TX_BUF_SIZE  64U
 
-static uint8_t g_rx_buf[CDC_RX_BUF_SIZE];
-static uint8_t g_tx_buf[CDC_TX_BUF_SIZE];
+#define CDC_QUEUE_LEN    16U   /* number of slots */
+#define CDC_QUEUE_ITEM   40U   /* max bytes per message */
+
+typedef struct {
+    uint8_t data[CDC_QUEUE_ITEM];
+    uint8_t len;
+} TxItem;
+
+static uint8_t  g_rx_buf[CDC_RX_BUF_SIZE];
+static uint8_t  g_tx_buf[CDC_TX_BUF_SIZE];
 static volatile uint8_t g_pending_cmd;
+
+static TxItem   g_queue[CDC_QUEUE_LEN];
+static uint8_t  g_q_head;   /* next slot to read (send) */
+static uint8_t  g_q_tail;   /* next slot to write       */
 
 static int8_t CDC_Init_FS(void) {
     USBD_CDC_SetRxBuffer(&g_usb_device_fs, g_rx_buf);
@@ -56,16 +68,32 @@ uint8_t cdc_get_pending_cmd(void) {
     return cmd;
 }
 
-uint8_t cdc_transmit(const uint8_t *buf, uint16_t len) {
-    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)g_usb_device_fs.pClassData;
+/* Try to send the next queued message if TX is free. Call from main loop. */
+void cdc_tx_poll(void) {
+    if (g_q_head == g_q_tail) return;
 
-    if (hcdc == NULL || hcdc->TxState != 0U) {
-        return USBD_BUSY;
+    USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef *)g_usb_device_fs.pClassData;
+    if (hcdc == NULL || hcdc->TxState != 0U) return;
+
+    TxItem *item = &g_queue[g_q_head];
+    memcpy(g_tx_buf, item->data, item->len);
+    USBD_CDC_SetTxBuffer(&g_usb_device_fs, g_tx_buf, item->len);
+    if (USBD_CDC_TransmitPacket(&g_usb_device_fs) == USBD_OK) {
+        g_q_head = (uint8_t)((g_q_head + 1U) % CDC_QUEUE_LEN);
     }
-    if (len > CDC_TX_BUF_SIZE) {
-        len = CDC_TX_BUF_SIZE;
-    }
-    memcpy(g_tx_buf, buf, len);
-    USBD_CDC_SetTxBuffer(&g_usb_device_fs, g_tx_buf, len);
-    return USBD_CDC_TransmitPacket(&g_usb_device_fs);
+}
+
+uint8_t cdc_transmit(const uint8_t *buf, uint16_t len) {
+    if (len == 0U) return USBD_OK;
+    if (len > CDC_QUEUE_ITEM) len = CDC_QUEUE_ITEM;
+
+    uint8_t next_tail = (uint8_t)((g_q_tail + 1U) % CDC_QUEUE_LEN);
+    if (next_tail == g_q_head) return USBD_BUSY;   /* queue full, drop */
+
+    memcpy(g_queue[g_q_tail].data, buf, len);
+    g_queue[g_q_tail].len = (uint8_t)len;
+    g_q_tail = next_tail;
+
+    cdc_tx_poll();   /* send immediately if TX is free */
+    return USBD_OK;
 }

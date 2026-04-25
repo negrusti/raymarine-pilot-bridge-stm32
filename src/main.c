@@ -87,6 +87,8 @@ int main(void) {
         }
 
         can_handler_poll();
+        can_handler_tx_poll();
+        cdc_tx_poll();
         board_leds_poll(HAL_GetTick());
     }
 }

@@ -1,0 +1,34 @@
+{
+  "build": {
+    "cpu": "cortex-m0",
+    "extra_flags": "-DSTM32F0 -DSTM32F072xB",
+    "f_cpu": "48000000L",
+    "mcu": "stm32f072cbt6",
+    "product_line": "STM32F072xB"
+  },
+  "debug": {
+    "jlink_device": "STM32F072CB",
+    "openocd_target": "stm32f0x",
+    "svd_path": "STM32F072x.svd"
+  },
+  "frameworks": [
+    "cmsis",
+    "stm32cube"
+  ],
+  "name": "CANable STM32F072CB",
+  "upload": {
+    "maximum_ram_size": 16384,
+    "maximum_size": 131072,
+    "protocol": "dfu",
+    "protocols": [
+      "blackmagic",
+      "cmsis-dap",
+      "dfu",
+      "jlink",
+      "serial",
+      "stlink"
+    ]
+  },
+  "url": "https://www.st.com/en/microcontrollers-microprocessors/stm32f072cb.html",
+  "vendor": "CANable"
+}

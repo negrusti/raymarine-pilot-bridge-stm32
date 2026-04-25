@@ -66,6 +66,24 @@ int main(void) {
         } else if (cmd == 's') {
             can_send_pilot_mode('s');
             cdc_transmit((uint8_t *)"STBY\r\n", 6U);
+        } else if (cmd == 'w') {
+            can_send_pilot_mode('w');
+            cdc_transmit((uint8_t *)"WIND\r\n", 6U);
+        } else if (cmd == 't') {
+            can_send_pilot_mode('t');
+            cdc_transmit((uint8_t *)"TRACK\r\n", 7U);
+        } else if (cmd == '+') {
+            can_send_keystroke('+');
+            cdc_transmit((uint8_t *)"+1\r\n", 4U);
+        } else if (cmd == '-') {
+            can_send_keystroke('-');
+            cdc_transmit((uint8_t *)"-1\r\n", 4U);
+        } else if (cmd == ']') {
+            can_send_keystroke(']');
+            cdc_transmit((uint8_t *)"+10\r\n", 5U);
+        } else if (cmd == '[') {
+            can_send_keystroke('[');
+            cdc_transmit((uint8_t *)"-10\r\n", 5U);
         }
 
         can_handler_poll();

@@ -31,7 +31,10 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length) {
 static int8_t CDC_Receive_FS(uint8_t *pbuf, uint32_t *len) {
     uint32_t i;
     for (i = 0U; i < *len; i++) {
-        if (pbuf[i] == 'a' || pbuf[i] == 's') {
+        if (pbuf[i] == 'a' || pbuf[i] == 's' ||
+            pbuf[i] == 'w' || pbuf[i] == 't' ||
+            pbuf[i] == '+' || pbuf[i] == '-' ||
+            pbuf[i] == ']' || pbuf[i] == '[') {
             g_pending_cmd = pbuf[i];
         }
     }

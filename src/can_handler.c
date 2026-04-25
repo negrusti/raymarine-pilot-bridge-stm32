@@ -21,6 +21,12 @@
 /* NMEA2000 PGN 126720, priority=3, DP=1, PF=0xEF, dst=115 (SeaTalk-NG), src=1 */
 #define PILOT_CMD_ID    0x0DEF7301UL
 
+/* Same PGN, priority=7, for keystroke commands */
+#define KEYSTROKE_CMD_ID 0x1DEF7301UL
+
+/* PGN 65379 (0xFF63) autopilot status broadcast: priority=7, DP=0, PF=0xFF, PS=0x63, src=1 */
+#define PGN65379_ID      0x1CFF6301UL
+
 /* PGN 126720 status from SeaTalk-NG (src=115). Mask ignores destination byte. */
 #define STATUS_ID_MASK  0x1FFF00FFUL
 #define STATUS_ID_VAL   0x1DEF0073UL
@@ -52,6 +58,7 @@ static struct {
 /* Last known state — 0xFF forces output on first packet */
 static uint8_t g_last_z = 0xFFU;
 static uint8_t g_last_m = 0xFFU;
+static uint8_t g_print_next_crs;
 
 static CAN_HandleTypeDef g_hcan;
 static uint8_t g_fast_seq;
@@ -144,22 +151,57 @@ static void send_raw_frame(uint32_t ext_id, const uint8_t *data, uint8_t dlc) {
     hdr.RTR = CAN_RTR_DATA;
     hdr.DLC = dlc;
     hdr.TransmitGlobalTime = DISABLE;
+    uint32_t tick = HAL_GetTick();
+    while (HAL_CAN_GetTxMailboxesFreeLevel(&g_hcan) == 0U) {
+        if (HAL_GetTick() - tick > 10U) return;
+    }
     HAL_CAN_AddTxMessage(&g_hcan, &hdr, (uint8_t *)data, &mailbox);
 }
 
 void can_send_pilot_mode(uint8_t mode) {
-    uint8_t mode_byte = (mode == 'a') ? 0x01U : 0x02U;
-    uint8_t inv_byte  = (mode == 'a') ? 0xFEU : 0xFDU;
     uint8_t seq = (g_fast_seq++ & 0x07U) << 5;
-
     uint8_t f0[8] = {seq,       0x10, 0x3B, 0x9F, 0xF0, 0x81, 0x86, 0x21};
-    uint8_t f1[8] = {seq | 1U, mode_byte, inv_byte, 0x00, 0x00, 0x00, 0x00, 0x00};
+    uint8_t f1[8] = {seq | 1U, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     uint8_t f2[8] = {seq | 2U, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    switch (mode) {
+        case 'a': f1[1]=0x01U; f1[2]=0xFEU; break;
+        case 's': f1[1]=0x02U; f1[2]=0xFDU; break;
+        case 'w': f1[1]=0x23U; f1[2]=0xDCU; break;
+        case 't': f1[1]=0x03U; f1[2]=0xFCU; f1[3]=0x3CU; f1[4]=0x42U; break;
+        default: return;
+    }
 
     send_raw_frame(PILOT_CMD_ID, f0, 8U);
     send_raw_frame(PILOT_CMD_ID, f1, 8U);
     send_raw_frame(PILOT_CMD_ID, f2, 8U);
 
+    board_leds_pulse_tx();
+}
+
+void can_send_keystroke(uint8_t key) {
+    uint8_t code, inv;
+    switch (key) {
+        case '+': code = 0x07U; inv = 0xF8U; break;
+        case '-': code = 0x05U; inv = 0xFAU; break;
+        case ']': code = 0x08U; inv = 0xF7U; break;
+        case '[': code = 0x06U; inv = 0xF9U; break;
+        default: return;
+    }
+
+    uint8_t seq = (g_fast_seq++ & 0x07U) << 5;
+
+    uint8_t f0[8] = {seq,       0x16, 0x3B, 0x9F, 0xF0, 0x81, 0x86, 0x21};
+    uint8_t f1[8] = {seq | 1U, code, inv,  0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t f2[8] = {seq | 2U, 0xC1, 0xC2, 0xCD, 0x66, 0x80, 0xD3, 0x42};
+    uint8_t f3[8] = {seq | 3U, 0xB1, 0xC8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    send_raw_frame(KEYSTROKE_CMD_ID, f0, 8U);
+    send_raw_frame(KEYSTROKE_CMD_ID, f1, 8U);
+    send_raw_frame(KEYSTROKE_CMD_ID, f2, 8U);
+    send_raw_frame(KEYSTROKE_CMD_ID, f3, 8U);
+
+    g_print_next_crs = 1U;
     board_leds_pulse_tx();
 }
 
@@ -268,6 +310,17 @@ static void process_pilot_status(void) {
         g_last_m = m;
         if (onset & 0x04U) cdc_transmit((uint8_t *)"< OCA\r\n", 7U);
         if (onset & 0x08U) cdc_transmit((uint8_t *)"< WSA\r\n", 7U);
+    }
+
+    /* Print confirmed AP course after a heading adjustment */
+    if (g_print_next_crs && (z & 0x02U)) {
+        g_print_next_crs = 0U;
+        char line[8];
+        uint8_t pos = 0;
+        line[pos++] = '>'; line[pos++] = ' '; line[pos++] = 'C';
+        fmt3(line + pos, crs % 360U); pos += 3;
+        line[pos++] = '\r'; line[pos++] = '\n';
+        cdc_transmit((uint8_t *)line, pos);
     }
 }
 
